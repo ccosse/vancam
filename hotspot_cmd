@@ -1,0 +1,1 @@
+nmcli dev wifi hotspot ifname wlp0s20f3 ssid VanCam password vancam123
