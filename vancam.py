@@ -1,29 +1,32 @@
 #!/usr/bin/env python3
 """
-vancam.py — ring-buffer capture + dump-to-zip + live preview + offline buffer playback
+vancam.py — ring-buffer capture + dump-to-zip + live preview + offline buffer playback + export MP4/PNGs
 
-Design:
+Key design:
   - Each camera /dev/video* is opened by exactly ONE process (ffmpeg).
   - ffmpeg writes:
       (A) rolling segment ring buffer to disk (MJPEG copied into MKV segments)
-      (B) local UDP preview stream on 127.0.0.1:<port> as H.264 in MPEG-TS (reliable)
+      (B) local UDP preview stream on 127.0.0.1:<port> as H.264 in MPEG-TS (reliable for ffplay)
   - Preview windows (ffplay) read UDP (not /dev/video), so you can close/reopen safely.
   - playbuf plays the last ~60s from disk even when capture is stopped.
+  - export merges the latest N seconds to MP4 and/or PNGs.
 
 Commands:
   ./vancam.py start --num 2
   ./vancam.py stop [--force]
   ./vancam.py status
-  ./vancam.py view --num 2            # live UDP preview (requires capture running)
+  ./vancam.py view --num 2
   ./vancam.py noview
-  ./vancam.py playbuf --num 2         # play last-minute buffer from disk (works even when stopped)
+  ./vancam.py playbuf --num 2
   ./vancam.py dump
+  ./vancam.py export --num 2 --seconds 60 --mp4 --png
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import math
 import os
 import re
 import shutil
@@ -34,7 +37,7 @@ import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 APP_ROOT = Path(".").resolve()
@@ -200,6 +203,19 @@ def kill_pidfile(path: Path, sig: int, kill_group: bool = True) -> None:
             pass
 
 
+def parse_meta(path: Path) -> Dict[str, str]:
+    d: Dict[str, str] = {}
+    if not path.exists():
+        return d
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        d[k.strip()] = v.strip()
+    return d
+
+
 def start_capture_ffmpeg(
     cam: CamSpec,
     buffers_root: Path,
@@ -222,9 +238,8 @@ def start_capture_ffmpeg(
     logfile = outdir / "ffmpeg.log"
     logf = open(logfile, "a", buffering=1)
 
-    # IMPORTANT:
-    #  - Output 0 (segments): copy MJPEG -> MKV (cheap)
-    #  - Output 1 (UDP preview): encode to H.264 -> MPEG-TS (reliable for ffplay)
+    # Output 0: ring buffer segments (cheap copy)
+    # Output 1: UDP preview as H.264 in MPEG-TS (reliable)
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -235,7 +250,6 @@ def start_capture_ffmpeg(
         "-framerate", str(fps),
         "-i", cam.devnode,
 
-        # Output 0: ring buffer segments
         "-map", "0:v",
         "-c:v:0", "copy",
         "-f", "segment",
@@ -244,13 +258,12 @@ def start_capture_ffmpeg(
         "-reset_timestamps", "1",
         seg_pattern,
 
-        # Output 1: UDP preview as H.264 in MPEG-TS
         "-map", "0:v",
         "-c:v:1", "libx264",
         "-preset", "ultrafast",
         "-tune", "zerolatency",
         "-pix_fmt", "yuv420p",
-        "-g", str(max(1, fps)),            # ~1s GOP
+        "-g", str(max(1, fps)),
         "-keyint_min", str(max(1, fps)),
         "-bf", "0",
         "-f", "mpegts",
@@ -304,7 +317,7 @@ def start_preview_ffplay_udp(cam_idx: int, buffers_root: Path, udp_port: int) ->
         "-fflags", "nobuffer",
         "-flags", "low_delay",
         "-probesize", "256k",
-        "-analyzeduration", "300000",  # 0.3s
+        "-analyzeduration", "300000",
         "-window_title", title,
         "-f", "mpegts",
         url,
@@ -329,7 +342,7 @@ def start_preview_ffplay_udp(cam_idx: int, buffers_root: Path, udp_port: int) ->
     return p.pid
 
 
-def build_concat_list(cam_path: Path, ext: str, wrap: int) -> List[Path]:
+def build_segments_by_mtime(cam_path: Path, ext: str, wrap: int) -> List[Path]:
     segs: List[Path] = []
     for i in range(wrap):
         f = cam_path / f"{i:03d}.{ext}"
@@ -349,7 +362,7 @@ def start_playbuf_ffplay(cam_idx: int, buffers_root: Path, ext: str, wrap: int) 
     if pid and is_pid_running(pid):
         return pid
 
-    segs = build_concat_list(outdir, ext=ext, wrap=wrap)
+    segs = build_segments_by_mtime(outdir, ext=ext, wrap=wrap)
     if not segs:
         print(f"WARNING: cam{cam_idx}: no segment files found to play.", file=sys.stderr)
         return -1
@@ -479,9 +492,10 @@ def status(buffers_root: Path) -> None:
 
         mf = d / "cam.meta"
         if mf.exists():
-            for line in mf.read_text().splitlines():
-                if line.startswith(("devnode=", "size=", "fps=", "input_format=", "udp_port=")):
-                    print("  " + line)
+            md = parse_meta(mf)
+            for k in ("devnode", "size", "fps", "input_format", "udp_port", "segment_seconds", "wrap", "ext"):
+                if k in md:
+                    print(f"  {k}={md[k]}")
 
 
 def dump_buffers(buffers_root: Path, dumps_root: Path, ext: str, wrap: int) -> List[Path]:
@@ -527,6 +541,110 @@ def dump_buffers(buffers_root: Path, dumps_root: Path, ext: str, wrap: int) -> L
         out_zips.append(zip_path)
 
     return out_zips
+
+
+def export_latest(
+    buffers_root: Path,
+    dumps_root: Path,
+    cam_indices: List[int],
+    seconds: int,
+    mp4: bool,
+    png: bool,
+    png_every: int,
+    crf: int,
+    preset: str,
+    force_fps: Optional[int],
+) -> List[Path]:
+    which_or_die("ffmpeg")
+    dumps_root.mkdir(parents=True, exist_ok=True)
+
+    ts = _dt.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    out_paths: List[Path] = []
+
+    for cam_idx in cam_indices:
+        cdir = cam_dir(buffers_root, cam_idx)
+        if not cdir.exists():
+            print(f"WARNING: cam{cam_idx}: missing directory {cdir}, skipping.", file=sys.stderr)
+            continue
+
+        md = parse_meta(meta_file(buffers_root, cam_idx))
+        ext = md.get("ext", DEFAULT_EXT)
+        wrap = int(md.get("wrap", str(DEFAULT_WRAP)))
+        seg_s = int(md.get("segment_seconds", str(DEFAULT_SEGMENT_SECONDS)))
+        fps = force_fps if force_fps is not None else int(md.get("fps", str(DEFAULT_FPS)))
+
+        segs = build_segments_by_mtime(cdir, ext=ext, wrap=wrap)
+        if not segs:
+            print(f"WARNING: cam{cam_idx}: no segments found, skipping.", file=sys.stderr)
+            continue
+
+        need = max(1, int(math.ceil(seconds / max(1, seg_s))))
+        chosen = segs[-need:]  # newest N by mtime
+        # concat list must be chronological
+        chosen.sort(key=lambda p: (p.stat().st_mtime, p.name))
+
+        concat_list = dumps_root / f"{ts}_cam{cam_idx}_concat.txt"
+        write_text_atomic(concat_list, "\n".join([f"file '{p.resolve()}'" for p in chosen]) + "\n")
+
+        mp4_path = dumps_root / f"{ts}_cam{cam_idx}.mp4"
+        png_dir = dumps_root / f"{ts}_cam{cam_idx}_png"
+
+        if mp4:
+            # Always transcode to H.264 MP4 for compatibility
+            cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", str(concat_list),
+                "-r", str(fps),
+                "-c:v", "libx264",
+                "-preset", preset,
+                "-crf", str(crf),
+                "-pix_fmt", "yuv420p",
+                str(mp4_path),
+            ]
+            subprocess.run(cmd, check=True)
+            out_paths.append(mp4_path)
+
+        if png:
+            png_dir.mkdir(parents=True, exist_ok=True)
+            # Source for PNG extraction: prefer mp4 if created, else concat list directly
+            if mp4 and mp4_path.exists():
+                src = str(mp4_path)
+                in_args = ["-i", src]
+            else:
+                in_args = ["-f", "concat", "-safe", "0", "-i", str(concat_list)]
+
+            vf = []
+            if png_every > 1:
+                # take every Nth frame
+                vf.append(f"select='not(mod(n\\,{png_every}))'")
+                # keep timestamps sane
+                vf.append("setpts=N/FRAME_RATE/TB")
+            vf_arg = []
+            if vf:
+                vf_arg = ["-vf", ",".join(vf)]
+
+            cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "error",
+                *in_args,
+                *vf_arg,
+                str(png_dir / f"cam{cam_idx}_%06d.png"),
+            ]
+            subprocess.run(cmd, check=True)
+            out_paths.append(png_dir)
+
+        # keep concat list for debugging only if desired; otherwise remove
+        try:
+            concat_list.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    return out_paths
 
 
 def main() -> int:
@@ -576,6 +694,18 @@ def main() -> int:
     p_dump.add_argument("--outdir", type=Path, default=DUMPS_ROOT_DEFAULT)
     p_dump.add_argument("--wrap", type=int, default=DEFAULT_WRAP)
     p_dump.add_argument("--ext", default=DEFAULT_EXT)
+
+    p_export = sub.add_parser("export")
+    p_export.add_argument("--buffers", type=Path, default=BUFFERS_ROOT_DEFAULT)
+    p_export.add_argument("--outdir", type=Path, default=DUMPS_ROOT_DEFAULT)
+    p_export.add_argument("--num", type=int, default=2)
+    p_export.add_argument("--seconds", type=int, default=60)
+    p_export.add_argument("--mp4", action="store_true", help="produce MP4 per cam")
+    p_export.add_argument("--png", action="store_true", help="extract PNG frames per cam")
+    p_export.add_argument("--png-every", type=int, default=1, help="keep every Nth frame (default 1=all frames)")
+    p_export.add_argument("--crf", type=int, default=23, help="H.264 quality (lower=better, bigger files)")
+    p_export.add_argument("--preset", default="veryfast", help="x264 preset (ultrafast..veryslow)")
+    p_export.add_argument("--fps", type=int, default=None, help="override output FPS for mp4/png extraction")
 
     args = ap.parse_args()
 
@@ -639,6 +769,26 @@ def main() -> int:
         zips = dump_buffers(args.buffers, args.outdir, ext=args.ext, wrap=args.wrap)
         for z in zips:
             print(str(z))
+        return 0
+
+    if args.cmd == "export":
+        if not args.mp4 and not args.png:
+            print("ERROR: export requires at least one of --mp4 or --png", file=sys.stderr)
+            return 2
+        outs = export_latest(
+            buffers_root=args.buffers,
+            dumps_root=args.outdir,
+            cam_indices=list(range(args.num)),
+            seconds=args.seconds,
+            mp4=args.mp4,
+            png=args.png,
+            png_every=max(1, args.png_every),
+            crf=args.crf,
+            preset=args.preset,
+            force_fps=args.fps,
+        )
+        for p in outs:
+            print(str(p))
         return 0
 
     return 1
